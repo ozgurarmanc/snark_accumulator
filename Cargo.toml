@@ -1,0 +1,23 @@
+[package]
+name = "snark_verify_test"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+itertools = "0.11"
+lazy_static = "1.4"
+num-bigint = "0.4"
+num-integer = "0.1.45"
+num-traits = "0.2.15"
+hex = "0.4"
+rand = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+pairing = { version = "0.23" }
+halo2_solidity_verifier = { git = "https://github.com/privacy-scaling-explorations/halo2-solidity-verifier"}
+snark-verifier = { git = "https://github.com/axiom-crypto/snark-verifier"}
+revm = { version = "=3.5.0", optional = true }
+
+[dev-dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
