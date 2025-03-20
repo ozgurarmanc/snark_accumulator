@@ -1,77 +1,215 @@
-#![allow(dead_code)]
-
 use itertools::Itertools;
 use rand::rngs::OsRng;
 use snark_verifier::{
-    halo2_base::halo2_proofs::{
-        halo2curves::bn256::{Bn256, Fq, Fr, G1Affine},
-        plonk::{
-            Circuit, ProvingKey, VerifyingKey, create_proof, keygen_pk, keygen_vk, verify_proof,
-        },
-        poly::{
-            VerificationStrategy,
-            commitment::ParamsProver,
-            kzg::{
-                commitment::{KZGCommitmentScheme, ParamsKZG},
-                multiopen::{ProverGWC, VerifierGWC},
-                strategy::AccumulatorStrategy,
+    loader::{
+        evm::{self, EvmLoader, deploy_and_call, encode_calldata},
+        halo2::halo2_wrong_ecc::halo2::{
+            dev::MockProver,
+            halo2curves::bn256::{Bn256, Fq, Fr, G1Affine},
+            plonk::{
+                Circuit, ProvingKey, VerifyingKey, create_proof, keygen_pk, keygen_vk, verify_proof,
             },
+            poly::{
+                VerificationStrategy,
+                commitment::{Params, ParamsProver},
+                kzg::{
+                    commitment::{KZGCommitmentScheme, ParamsKZG},
+                    multiopen::{ProverGWC, VerifierGWC},
+                    strategy::AccumulatorStrategy,
+                },
+            },
+            transcript::{EncodedChallenge, TranscriptReadBuffer, TranscriptWriterBuffer},
         },
-        transcript::{EncodedChallenge, TranscriptReadBuffer, TranscriptWriterBuffer},
+        native::NativeLoader,
     },
-    loader::evm::{self, EvmLoader},
     pcs::kzg::{Gwc19, KzgAs, LimbsEncoding},
     system::halo2::{Config, compile, transcript::evm::EvmTranscript},
     verifier::{self, SnarkVerifier},
 };
 use std::{io::Cursor, rc::Rc};
 
-const LIMBS: usize = 3;
-const BITS: usize = 88;
+const LIMBS: usize = 4;
+const BITS: usize = 68;
 
 type As = KzgAs<Bn256, Gwc19>;
 type PlonkSuccinctVerifier = verifier::plonk::PlonkSuccinctVerifier<As, LimbsEncoding<LIMBS, BITS>>;
 type PlonkVerifier = verifier::plonk::PlonkVerifier<As, LimbsEncoding<LIMBS, BITS>>;
 
-mod aggregation {
-    use std::{mem, rc::Rc};
+mod application {
 
+    use pairing::group::ff::Field;
+    use rand::RngCore;
+    use snark_verifier::loader::halo2::halo2_wrong_ecc::halo2::{
+        circuit::{Layouter, SimpleFloorPlanner, Value},
+        halo2curves::bn256::Fr,
+        plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Fixed, Instance},
+        poly::Rotation,
+    };
+
+    #[derive(Clone, Copy)]
+    pub struct StandardPlonkConfig {
+        a: Column<Advice>,
+        b: Column<Advice>,
+        c: Column<Advice>,
+        q_a: Column<Fixed>,
+        q_b: Column<Fixed>,
+        q_c: Column<Fixed>,
+        q_ab: Column<Fixed>,
+        constant: Column<Fixed>,
+        #[allow(dead_code)]
+        instance: Column<Instance>,
+    }
+
+    impl StandardPlonkConfig {
+        fn configure(meta: &mut ConstraintSystem<Fr>) -> Self {
+            let [a, b, c] = [(); 3].map(|_| meta.advice_column());
+            let [q_a, q_b, q_c, q_ab, constant] = [(); 5].map(|_| meta.fixed_column());
+            let instance = meta.instance_column();
+
+            [a, b, c].map(|column| meta.enable_equality(column));
+
+            meta.create_gate(
+                "q_a·a + q_b·b + q_c·c + q_ab·a·b + constant + instance = 0",
+                |meta| {
+                    let [a, b, c] =
+                        [a, b, c].map(|column| meta.query_advice(column, Rotation::cur()));
+                    let [q_a, q_b, q_c, q_ab, constant] = [q_a, q_b, q_c, q_ab, constant]
+                        .map(|column| meta.query_fixed(column, Rotation::cur()));
+                    let instance = meta.query_instance(instance, Rotation::cur());
+                    Some(
+                        q_a * a.clone()
+                            + q_b * b.clone()
+                            + q_c * c
+                            + q_ab * a * b
+                            + constant
+                            + instance,
+                    )
+                },
+            );
+
+            StandardPlonkConfig {
+                a,
+                b,
+                c,
+                q_a,
+                q_b,
+                q_c,
+                q_ab,
+                constant,
+                instance,
+            }
+        }
+    }
+
+    #[derive(Clone, Default)]
+    pub struct StandardPlonk(Fr);
+
+    impl StandardPlonk {
+        pub fn rand<R: RngCore>(mut rng: R) -> Self {
+            Self(Fr::from(rng.next_u32() as u64))
+        }
+
+        pub fn num_instance() -> Vec<usize> {
+            vec![1]
+        }
+
+        pub fn instances(&self) -> Vec<Vec<Fr>> {
+            vec![vec![self.0]]
+        }
+    }
+
+    impl Circuit<Fr> for StandardPlonk {
+        type Config = StandardPlonkConfig;
+        type FloorPlanner = SimpleFloorPlanner;
+        #[cfg(feature = "halo2_circuit_params")]
+        type Params = ();
+
+        fn without_witnesses(&self) -> Self {
+            Self::default()
+        }
+
+        fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
+            meta.set_minimum_degree(4);
+            StandardPlonkConfig::configure(meta)
+        }
+
+        fn synthesize(
+            &self,
+            config: Self::Config,
+            mut layouter: impl Layouter<Fr>,
+        ) -> Result<(), Error> {
+            layouter.assign_region(
+                || "",
+                |mut region| {
+                    region.assign_advice(|| "", config.a, 0, || Value::known(self.0))?;
+                    region.assign_fixed(|| "", config.q_a, 0, || Value::known(-Fr::ONE))?;
+
+                    region.assign_advice(|| "", config.a, 1, || Value::known(-Fr::from(5)))?;
+                    for (idx, column) in (1..).zip([
+                        config.q_a,
+                        config.q_b,
+                        config.q_c,
+                        config.q_ab,
+                        config.constant,
+                    ]) {
+                        region.assign_fixed(|| "", column, 1, || Value::known(Fr::from(idx)))?;
+                    }
+
+                    let a = region.assign_advice(|| "", config.a, 2, || Value::known(Fr::ONE))?;
+                    a.copy_advice(|| "", &mut region, config.b, 3)?;
+                    a.copy_advice(|| "", &mut region, config.c, 4)?;
+
+                    Ok(())
+                },
+            )
+        }
+    }
+}
+
+mod aggregation {
+    use super::{As, BITS, LIMBS, PlonkSuccinctVerifier};
     use itertools::Itertools;
     use rand::rngs::OsRng;
     use snark_verifier::{
-        halo2_base::{
-            gates::{
-                circuit::{BaseCircuitParams, CircuitBuilderStage, builder::BaseCircuitBuilder},
-                flex_gate::MultiPhaseThreadBreakPoints,
+        loader::{
+            self,
+            halo2::halo2_wrong_ecc::{
+                self, EccConfig,
+                halo2::{
+                    circuit::{Layouter, SimpleFloorPlanner, Value},
+                    halo2curves::bn256::{Bn256, Fq, Fr, G1Affine},
+                    plonk::{self, Circuit, ConstraintSystem, Error},
+                    poly::{commitment::ParamsProver, kzg::commitment::ParamsKZG},
+                },
+                integer::rns::Rns,
+                maingate::{
+                    MainGate, MainGateConfig, MainGateInstructions, RangeChip, RangeConfig,
+                    RangeInstructions, RegionCtx,
+                },
             },
-            halo2_proofs::halo2curves::bn256::{Fr, G1Affine},
+            native::NativeLoader,
         },
-        halo2_ecc::{self, bn254::FpChip},
-        loader::{self, native::NativeLoader},
         pcs::{
             AccumulationScheme, AccumulationSchemeProver,
-            kzg::{KzgAccumulator, KzgSuccinctVerifyingKey},
+            kzg::{KzgAccumulator, KzgSuccinctVerifyingKey, LimbsEncodingInstructions},
         },
         system,
-        util::arithmetic::fe_to_limbs,
+        util::arithmetic::{PrimeField, fe_to_limbs},
         verifier::{SnarkVerifier, plonk::PlonkProtocol},
     };
+    use std::rc::Rc;
 
-    use super::{As, BITS, LIMBS, PlonkSuccinctVerifier};
-
-    const T: usize = 3;
-    const RATE: usize = 2;
+    const T: usize = 5;
+    const RATE: usize = 4;
     const R_F: usize = 8;
-    const R_P: usize = 57;
-    const SECURE_MDS: usize = 0;
+    const R_P: usize = 60;
 
     type Svk = KzgSuccinctVerifyingKey<G1Affine>;
-    type BaseFieldEccChip<'chip> = halo2_ecc::ecc::BaseFieldEccChip<'chip, G1Affine>;
-    type Halo2Loader<'chip> = loader::halo2::Halo2Loader<G1Affine, BaseFieldEccChip<'chip>>;
+    type BaseFieldEccChip = halo2_wrong_ecc::BaseFieldEccChip<G1Affine, LIMBS, BITS>;
+    type Halo2Loader<'a> = loader::halo2::Halo2Loader<'a, G1Affine, BaseFieldEccChip>;
     pub type PoseidonTranscript<L, S> =
         system::halo2::transcript::halo2::PoseidonTranscript<G1Affine, L, S, T, RATE, R_F, R_P>;
 
-    #[derive(Clone)]
     pub struct Snark {
         protocol: PlonkProtocol<G1Affine>,
         instances: Vec<Vec<Fr>>,
@@ -92,19 +230,52 @@ mod aggregation {
         }
     }
 
-    impl Snark {
-        fn proof(&self) -> &[u8] {
-            self.proof.as_slice()
+    impl From<Snark> for SnarkWitness {
+        fn from(snark: Snark) -> Self {
+            Self {
+                protocol: snark.protocol,
+                instances: snark
+                    .instances
+                    .into_iter()
+                    .map(|instances| instances.into_iter().map(Value::known).collect_vec())
+                    .collect(),
+                proof: Value::known(snark.proof),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct SnarkWitness {
+        protocol: PlonkProtocol<G1Affine>,
+        instances: Vec<Vec<Value<Fr>>>,
+        proof: Value<Vec<u8>>,
+    }
+
+    impl SnarkWitness {
+        fn without_witnesses(&self) -> Self {
+            SnarkWitness {
+                protocol: self.protocol.clone(),
+                instances: self
+                    .instances
+                    .iter()
+                    .map(|instances| vec![Value::unknown(); instances.len()])
+                    .collect(),
+                proof: Value::unknown(),
+            }
+        }
+
+        fn proof(&self) -> Value<&[u8]> {
+            self.proof.as_ref().map(Vec::as_slice)
         }
     }
 
     pub fn aggregate<'a>(
         svk: &Svk,
         loader: &Rc<Halo2Loader<'a>>,
-        snarks: &[Snark],
-        as_proof: &[u8],
+        snarks: &[SnarkWitness],
+        as_proof: Value<&'_ [u8]>,
     ) -> KzgAccumulator<G1Affine, Rc<Halo2Loader<'a>>> {
-        let assign_instances = |instances: &[Vec<Fr>]| {
+        let assign_instances = |instances: &[Vec<Value<Fr>>]| {
             instances
                 .iter()
                 .map(|instances| {
@@ -122,7 +293,7 @@ mod aggregation {
                 let protocol = snark.protocol.loaded(loader);
                 let instances = assign_instances(&snark.instances);
                 let mut transcript =
-                    PoseidonTranscript::<Rc<Halo2Loader>, _>::new::<0>(loader, snark.proof());
+                    PoseidonTranscript::<Rc<Halo2Loader>, _>::new(loader, snark.proof());
                 let proof =
                     PlonkSuccinctVerifier::read_proof(svk, &protocol, &instances, &mut transcript)
                         .unwrap();
@@ -130,45 +301,71 @@ mod aggregation {
             })
             .collect_vec();
 
-        let mut transcript =
-            PoseidonTranscript::<Rc<Halo2Loader>, _>::new::<SECURE_MDS>(loader, as_proof);
-        let proof = As::read_proof(&Default::default(), &accumulators, &mut transcript).unwrap();
-        As::verify(&Default::default(), &accumulators, &proof).unwrap()
+        let acccumulator = {
+            let mut transcript = PoseidonTranscript::<Rc<Halo2Loader>, _>::new(loader, as_proof);
+            let proof =
+                As::read_proof(&Default::default(), &accumulators, &mut transcript).unwrap();
+            As::verify(&Default::default(), &accumulators, &proof).unwrap()
+        };
+
+        acccumulator
     }
 
-    #[derive(serde::Serialize, serde::Deserialize, Default)]
-    pub struct AggregationConfigParams {
-        pub degree: u32,
-        pub num_advice: usize,
-        pub num_lookup_advice: usize,
-        pub num_fixed: usize,
-        pub lookup_bits: usize,
+    #[derive(Clone)]
+    pub struct AggregationConfig {
+        main_gate_config: MainGateConfig,
+        range_config: RangeConfig,
     }
 
-    #[derive(Clone, Debug)]
+    impl AggregationConfig {
+        pub fn configure<F: PrimeField>(
+            meta: &mut ConstraintSystem<F>,
+            composition_bits: Vec<usize>,
+            overflow_bits: Vec<usize>,
+        ) -> Self {
+            let main_gate_config = MainGate::<F>::configure(meta);
+            let range_config =
+                RangeChip::<F>::configure(meta, &main_gate_config, composition_bits, overflow_bits);
+            AggregationConfig {
+                main_gate_config,
+                range_config,
+            }
+        }
+
+        pub fn main_gate(&self) -> MainGate<Fr> {
+            MainGate::new(self.main_gate_config.clone())
+        }
+
+        pub fn range_chip(&self) -> RangeChip<Fr> {
+            RangeChip::new(self.range_config.clone())
+        }
+
+        pub fn ecc_chip(&self) -> BaseFieldEccChip {
+            BaseFieldEccChip::new(EccConfig::new(
+                self.range_config.clone(),
+                self.main_gate_config.clone(),
+            ))
+        }
+    }
+
+    #[derive(Clone)]
     pub struct AggregationCircuit {
-        pub inner: BaseCircuitBuilder<Fr>,
-        pub as_proof: Vec<u8>,
+        svk: Svk,
+        snarks: Vec<SnarkWitness>,
+        instances: Vec<Fr>,
+        as_proof: Value<Vec<u8>>,
     }
 
     impl AggregationCircuit {
-        pub fn new(
-            stage: CircuitBuilderStage,
-            circuit_params: BaseCircuitParams,
-            break_points: Option<MultiPhaseThreadBreakPoints>,
-            params_g0: G1Affine,
-            snarks: impl IntoIterator<Item = Snark>,
-        ) -> Self {
-            let svk: Svk = params_g0.into();
+        pub fn new(params: &ParamsKZG<Bn256>, snarks: impl IntoIterator<Item = Snark>) -> Self {
+            let svk = params.get_g()[0].into();
             let snarks = snarks.into_iter().collect_vec();
 
-            // verify the snarks natively to get public instances
             let accumulators = snarks
                 .iter()
                 .flat_map(|snark| {
-                    let mut transcript = PoseidonTranscript::<NativeLoader, _>::new::<SECURE_MDS>(
-                        snark.proof.as_slice(),
-                    );
+                    let mut transcript =
+                        PoseidonTranscript::<NativeLoader, _>::new(snark.proof.as_slice());
                     let proof = PlonkSuccinctVerifier::read_proof(
                         &svk,
                         &snark.protocol,
@@ -181,85 +378,122 @@ mod aggregation {
                 })
                 .collect_vec();
 
-            let (_accumulator, as_proof) = {
-                let mut transcript =
-                    PoseidonTranscript::<NativeLoader, _>::new::<SECURE_MDS>(Vec::new());
+            let (accumulator, as_proof) = {
+                let mut transcript = PoseidonTranscript::<NativeLoader, _>::new(Vec::new());
                 let accumulator =
                     As::create_proof(&Default::default(), &accumulators, &mut transcript, OsRng)
                         .unwrap();
                 (accumulator, transcript.finalize())
             };
 
-            let mut builder = BaseCircuitBuilder::from_stage(stage).use_params(circuit_params);
-            // create halo2loader
-            let range = builder.range_chip();
-            let fp_chip = FpChip::<Fr>::new(&range, BITS, LIMBS);
-            let ecc_chip = BaseFieldEccChip::new(&fp_chip);
-            let pool = mem::take(builder.pool(0));
-            let loader = Halo2Loader::new(ecc_chip, pool);
+            let KzgAccumulator { lhs, rhs } = accumulator;
+            let instances = [lhs.x, lhs.y, rhs.x, rhs.y]
+                .map(fe_to_limbs::<_, _, LIMBS, BITS>)
+                .concat();
 
-            // witness generation
-            let KzgAccumulator { lhs, rhs } =
-                aggregate(&svk, &loader, &snarks, as_proof.as_slice());
-            let lhs = lhs.assigned();
-            let rhs = rhs.assigned();
-            let assigned_instances = lhs
-                .x()
-                .limbs()
-                .iter()
-                .chain(lhs.y().limbs().iter())
-                .chain(rhs.x().limbs().iter())
-                .chain(rhs.y().limbs().iter())
-                .copied()
-                .collect_vec();
-
-            #[cfg(debug_assertions)]
-            {
-                let KzgAccumulator { lhs, rhs } = _accumulator;
-                let instances = [lhs.x, lhs.y, rhs.x, rhs.y]
-                    .map(fe_to_limbs::<_, Fr, LIMBS, BITS>)
-                    .concat();
-                for (lhs, rhs) in instances.iter().zip(assigned_instances.iter()) {
-                    assert_eq!(lhs, rhs.value());
-                }
-            }
-
-            *builder.pool(0) = loader.take_ctx();
-            builder.assigned_instances[0] = assigned_instances;
-            if let Some(break_points) = break_points {
-                builder.set_break_points(break_points);
-            }
             Self {
-                inner: builder,
-                as_proof,
+                svk,
+                snarks: snarks.into_iter().map_into().collect(),
+                instances,
+                as_proof: Value::known(as_proof),
             }
-        }
-
-        pub fn num_instance() -> Vec<usize> {
-            // [..lhs, ..rhs]
-            vec![4 * LIMBS]
-        }
-
-        pub fn instances(&self) -> Vec<Vec<Fr>> {
-            self.inner
-                .assigned_instances
-                .iter()
-                .map(|v| v.iter().map(|v| *v.value()).collect_vec())
-                .collect()
         }
 
         pub fn accumulator_indices() -> Vec<(usize, usize)> {
             (0..4 * LIMBS).map(|idx| (0, idx)).collect()
         }
+
+        pub fn num_instance() -> Vec<usize> {
+            vec![4 * LIMBS]
+        }
+
+        pub fn instances(&self) -> Vec<Vec<Fr>> {
+            vec![self.instances.clone()]
+        }
+
+        pub fn as_proof(&self) -> Value<&[u8]> {
+            self.as_proof.as_ref().map(Vec::as_slice)
+        }
     }
+
+    impl Circuit<Fr> for AggregationCircuit {
+        type Config = AggregationConfig;
+        type FloorPlanner = SimpleFloorPlanner;
+        #[cfg(feature = "halo2_circuit_params")]
+        type Params = ();
+
+        fn without_witnesses(&self) -> Self {
+            Self {
+                svk: self.svk,
+                snarks: self
+                    .snarks
+                    .iter()
+                    .map(SnarkWitness::without_witnesses)
+                    .collect(),
+                instances: Vec::new(),
+                as_proof: Value::unknown(),
+            }
+        }
+
+        fn configure(meta: &mut plonk::ConstraintSystem<Fr>) -> Self::Config {
+            AggregationConfig::configure(
+                meta,
+                vec![BITS / LIMBS],
+                Rns::<Fq, Fr, LIMBS, BITS>::construct().overflow_lengths(),
+            )
+        }
+
+        fn synthesize(
+            &self,
+            config: Self::Config,
+            mut layouter: impl Layouter<Fr>,
+        ) -> Result<(), plonk::Error> {
+            let main_gate = config.main_gate();
+            let range_chip = config.range_chip();
+
+            range_chip.load_table(&mut layouter)?;
+
+            let accumulator_limbs = layouter.assign_region(
+                || "",
+                |region| {
+                    let ctx = RegionCtx::new(region, 0);
+
+                    let ecc_chip = config.ecc_chip();
+                    let loader = Halo2Loader::new(ecc_chip, ctx);
+                    let accumulator = aggregate(&self.svk, &loader, &self.snarks, self.as_proof());
+
+                    let accumulator_limbs = [accumulator.lhs, accumulator.rhs]
+                        .iter()
+                        .map(|ec_point| {
+                            loader.ecc_chip().assign_ec_point_to_limbs(
+                                &mut loader.ctx_mut(),
+                                ec_point.assigned(),
+                            )
+                        })
+                        .collect::<Result<Vec<_>, Error>>()?
+                        .into_iter()
+                        .flatten();
+
+                    Ok(accumulator_limbs)
+                },
+            )?;
+
+            for (row, limb) in accumulator_limbs.enumerate() {
+                main_gate.expose_public(layouter.namespace(|| ""), limb, row)?;
+            }
+
+            Ok(())
+        }
+    }
+}
+
+fn gen_srs(k: u32) -> ParamsKZG<Bn256> {
+    ParamsKZG::<Bn256>::setup(k, OsRng)
 }
 
 fn gen_pk<C: Circuit<Fr>>(params: &ParamsKZG<Bn256>, circuit: &C) -> ProvingKey<G1Affine> {
     let vk = keygen_vk(params, circuit).unwrap();
-    println!("finished vk");
-    let pk = keygen_pk(params, vk, circuit).unwrap();
-    println!("finished pk");
-    pk
+    keygen_pk(params, vk, circuit).unwrap()
 }
 
 fn gen_proof<
@@ -273,6 +507,10 @@ fn gen_proof<
     circuit: C,
     instances: Vec<Vec<Fr>>,
 ) -> Vec<u8> {
+    MockProver::run(params.k(), &circuit, instances.clone())
+        .unwrap()
+        .assert_satisfied();
+
     let instances = instances
         .iter()
         .map(|instances| instances.as_slice())
@@ -309,6 +547,25 @@ fn gen_proof<
     proof
 }
 
+fn gen_application_snark(params: &ParamsKZG<Bn256>) -> aggregation::Snark {
+    let circuit = application::StandardPlonk::rand(OsRng);
+
+    let pk = gen_pk(params, &circuit);
+    let protocol = compile(
+        params,
+        pk.get_vk(),
+        Config::kzg().with_num_instance(application::StandardPlonk::num_instance()),
+    );
+
+    let proof = gen_proof::<
+        _,
+        _,
+        aggregation::PoseidonTranscript<NativeLoader, _>,
+        aggregation::PoseidonTranscript<NativeLoader, _>,
+    >(params, &pk, circuit.clone(), circuit.instances());
+    aggregation::Snark::new(protocol, circuit.instances(), proof)
+}
+
 fn gen_aggregation_evm_verifier(
     params: &ParamsKZG<Bn256>,
     vk: &VerifyingKey<G1Affine>,
@@ -335,7 +592,6 @@ fn gen_aggregation_evm_verifier(
     evm::compile_solidity(&loader.solidity_code())
 }
 
-#[cfg(feature = "revm")]
 fn evm_verify(deployment_code: Vec<u8>, instances: Vec<Vec<Fr>>, proof: Vec<u8>) {
     let calldata = encode_calldata(&instances, &proof);
     let gas_cost = deploy_and_call(deployment_code, calldata).unwrap();
@@ -344,32 +600,34 @@ fn evm_verify(deployment_code: Vec<u8>, instances: Vec<Vec<Fr>>, proof: Vec<u8>)
 
 #[cfg(test)]
 mod test {
-    use super::{
-        aggregation::{self, AggregationCircuit, AggregationConfigParams, Snark},
-        gen_aggregation_evm_verifier, gen_pk, gen_proof,
-    };
-    use crate::mul::MulChip;
+
     use snark_verifier::{
-        halo2_base::{
-            gates::circuit::{BaseCircuitParams, CircuitBuilderStage},
-            halo2_proofs::{
-                dev::MockProver,
+        loader::{
+            halo2::halo2_wrong_ecc::halo2::{
                 halo2curves::bn256::{Bn256, Fr, G1Affine},
                 poly::{commitment::ParamsProver, kzg::commitment::ParamsKZG},
             },
-            utils::fs::gen_srs,
+            native::NativeLoader,
         },
-        loader::native::NativeLoader,
         system::halo2::{Config, compile, transcript::evm::EvmTranscript},
+    };
+
+    use crate::mul::MulChip;
+
+    use super::{
+        aggregation::{self, Snark},
+        evm_verify, gen_aggregation_evm_verifier, gen_pk, gen_proof, gen_srs,
     };
 
     #[test]
     fn test_aggregation() {
         // Testing Aggregator
-        let k = 21;
-        let params_app = gen_srs(k);
 
-        let params = ParamsKZG::<Bn256>::new(k);
+        //let k = 21;
+        //let params_app = gen_srs(k);
+        //let params = ParamsKZG::<Bn256>::new(k);
+
+        let params = gen_srs(22);
 
         let random_circuit_1 = MulChip::new(Fr::one(), Fr::one());
         let random_circuit_2 = MulChip::new(Fr::one(), Fr::one());
@@ -410,71 +668,89 @@ mod test {
         let snark_1 = Snark::new(protocol_1, instances_1, proof_1);
         let snark_2 = Snark::new(protocol_2, instances_2, proof_2);
         let snarks = [snark_1, snark_2];
-        let agg_config = AggregationConfigParams {
-            degree: k,
-            num_advice: 3,
-            num_lookup_advice: 1,
-            num_fixed: 1,
-            lookup_bits: 20,
-        };
 
-        let mut circuit_params = BaseCircuitParams {
-            k: agg_config.degree as usize,
-            num_advice_per_phase: vec![agg_config.num_advice],
-            num_lookup_advice_per_phase: vec![agg_config.num_lookup_advice],
-            num_fixed: agg_config.num_fixed,
-            lookup_bits: Some(agg_config.lookup_bits),
-            num_instance_columns: 1,
-        };
-
-        let mut agg_circuit = AggregationCircuit::new(
-            CircuitBuilderStage::Mock,
-            circuit_params,
-            None,
-            params_app.get_g()[0],
-            snarks.clone(),
-        );
-
-        circuit_params = agg_circuit.inner.calculate_params(Some(9));
-        #[cfg(debug_assertions)]
-        {
-            MockProver::run(
-                agg_config.degree,
-                &agg_circuit.inner,
-                agg_circuit.instances(),
-            )
-            .unwrap()
-            .assert_satisfied();
-            println!("mock prover passed");
-        }
-
-        let params = gen_srs(agg_config.degree);
-        let pk = gen_pk(&params, &agg_circuit.inner);
-        let _deployment_code = gen_aggregation_evm_verifier(
+        let agg_circuit = aggregation::AggregationCircuit::new(&params, snarks);
+        let pk = gen_pk(&params, &agg_circuit);
+        let deployment_code = gen_aggregation_evm_verifier(
             &params,
             pk.get_vk(),
             aggregation::AggregationCircuit::num_instance(),
             aggregation::AggregationCircuit::accumulator_indices(),
         );
 
-        let break_points = agg_circuit.inner.break_points();
-        drop(agg_circuit);
+        let proof = gen_proof::<
+            _,
+            _,
+            EvmTranscript<G1Affine, _, _, _>,
+            EvmTranscript<G1Affine, _, _, _>,
+        >(&params, &pk, agg_circuit.clone(), agg_circuit.instances());
+        evm_verify(deployment_code, agg_circuit.instances(), proof);
 
-        let agg_circuit = AggregationCircuit::new(
-            CircuitBuilderStage::Prover,
-            circuit_params,
-            Some(break_points),
-            params_app.get_g()[0],
-            snarks,
-        );
-        let instances = agg_circuit.instances();
-        let _proof = gen_proof::<
-            _,
-            _,
-            EvmTranscript<G1Affine, _, _, _>,
-            EvmTranscript<G1Affine, _, _, _>,
-        >(&params, &pk, agg_circuit.inner, instances.clone());
-        #[cfg(feature = "revm")]
-        evm_verify(_deployment_code, instances, _proof);
+        // let agg_config = AggregationConfigParams {
+        //     degree: k,
+        //     num_advice: 3,
+        //     num_lookup_advice: 1,
+        //     num_fixed: 1,
+        //     lookup_bits: 20,
+        // };
+
+        // let mut circuit_params = BaseCircuitParams {
+        //     k: agg_config.degree as usize,
+        //     num_advice_per_phase: vec![agg_config.num_advice],
+        //     num_lookup_advice_per_phase: vec![agg_config.num_lookup_advice],
+        //     num_fixed: agg_config.num_fixed,
+        //     lookup_bits: Some(agg_config.lookup_bits),
+        //     num_instance_columns: 1,
+        // };
+
+        // let mut agg_circuit = AggregationCircuit::new(
+        //     CircuitBuilderStage::Mock,
+        //     circuit_params,
+        //     None,
+        //     params_app.get_g()[0],
+        //     snarks.clone(),
+        // );
+
+        // circuit_params = agg_circuit.inner.calculate_params(Some(9));
+        // #[cfg(debug_assertions)]
+        // {
+        //     MockProver::run(
+        //         agg_config.degree,
+        //         &agg_circuit.inner,
+        //         agg_circuit.instances(),
+        //     )
+        //     .unwrap()
+        //     .assert_satisfied();
+        //     println!("mock prover passed");
+        // }
+
+        // let params = gen_srs(agg_config.degree);
+        // let pk = gen_pk(&params, &agg_circuit.inner);
+        // let _deployment_code = gen_aggregation_evm_verifier(
+        //     &params,
+        //     pk.get_vk(),
+        //     aggregation::AggregationCircuit::num_instance(),
+        //     aggregation::AggregationCircuit::accumulator_indices(),
+        // );
+
+        // let break_points = agg_circuit.inner.break_points();
+        // drop(agg_circuit);
+
+        // let agg_circuit = AggregationCircuit::new(
+        //     CircuitBuilderStage::Prover,
+        //     circuit_params,
+        //     Some(break_points),
+        //     params_app.get_g()[0],
+        //     snarks,
+        // );
+        // let instances = agg_circuit.instances();
+        // let _proof = gen_proof::<
+        //     _,
+        //     _,
+        //     EvmTranscript<G1Affine, _, _, _>,
+        //     EvmTranscript<G1Affine, _, _, _>,
+        // >(&params, &pk, agg_circuit.inner, instances.clone());
+        // #[cfg(feature = "revm")]
+        // evm_verify(_deployment_code, instances, _proof);
     }
 }
