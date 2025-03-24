@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use pairing::group::ff::Field;
-use snark_verifier::loader::halo2::halo2_wrong_ecc::halo2::{
+use snark_verifier::halo2_base::halo2_proofs::{
     circuit::{Layouter, Region, SimpleFloorPlanner, Value},
     plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Instance, Selector},
     poly::Rotation,
@@ -40,6 +40,8 @@ impl<F: Field> Circuit<F> for MulChip<F> {
     type Config = MulConfig;
 
     type FloorPlanner = SimpleFloorPlanner;
+
+    type Params = ();
 
     fn without_witnesses(&self) -> Self {
         Self {
@@ -81,22 +83,17 @@ impl<F: Field> Circuit<F> for MulChip<F> {
 
     /// Synthesize the circuit.
     fn synthesize(&self, config: MulConfig, mut layouter: impl Layouter<F>) -> Result<(), Error> {
-        let result = layouter
-            .assign_region(
-                || "Mul",
-                |mut region: Region<'_, F>| {
-                    config.selector.enable(&mut region, 0)?;
+        let result = layouter.assign_region(
+            || "Mul",
+            |mut region: Region<'_, F>| {
+                config.selector.enable(&mut region, 1)?;
+                let val = self.a * self.b;
+                let mul = region.assign_advice(config.a, 1, val);
 
-                    let assigned_x = region.assign_advice(|| "temp", config.a, 0, || self.a)?;
-                    let assigned_y = region.assign_advice(|| "temp", config.b, 0, || self.b)?;
-                    let val = assigned_x.value().cloned() * assigned_y.value().cloned();
-                    let mul = region.assign_advice(|| "mul", config.a, 1, || val);
-
-                    Ok(mul)
-                },
-            )?
-            .unwrap();
-        let _ = layouter.constrain_instance(result.cell(), config.ins, 0);
+                Ok(mul)
+            },
+        )?;
+        layouter.constrain_instance(result.cell(), config.ins, 0);
 
         Ok(())
     }
@@ -104,11 +101,9 @@ impl<F: Field> Circuit<F> for MulChip<F> {
 
 #[cfg(test)]
 mod test {
-    use snark_verifier::loader::halo2::halo2_wrong_ecc::halo2::{
-        dev::MockProver, halo2curves::bn256::Fr,
-    };
-
     use super::*;
+    use snark_verifier::halo2_base::halo2_proofs::{dev::MockProver, halo2curves::bn256::Fr};
+
     #[test]
     fn test_mul() {
         // Testing 5 * 2
