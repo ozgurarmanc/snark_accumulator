@@ -33,7 +33,7 @@ type As = KzgAs<Bn256, Gwc19>;
 type PlonkSuccinctVerifier = verifier::plonk::PlonkSuccinctVerifier<As, LimbsEncoding<LIMBS, BITS>>;
 type PlonkVerifier = verifier::plonk::PlonkVerifier<As, LimbsEncoding<LIMBS, BITS>>;
 
-mod aggregation {
+pub mod aggregation {
     use std::{mem, rc::Rc};
 
     use itertools::Itertools;
@@ -254,7 +254,7 @@ mod aggregation {
     }
 }
 
-fn gen_pk<C: Circuit<Fr>>(params: &ParamsKZG<Bn256>, circuit: &C) -> ProvingKey<G1Affine> {
+pub fn gen_pk<C: Circuit<Fr>>(params: &ParamsKZG<Bn256>, circuit: &C) -> ProvingKey<G1Affine> {
     let vk = keygen_vk(params, circuit).unwrap();
     println!("finished vk");
     let pk = keygen_pk(params, vk, circuit).unwrap();
@@ -262,7 +262,7 @@ fn gen_pk<C: Circuit<Fr>>(params: &ParamsKZG<Bn256>, circuit: &C) -> ProvingKey<
     pk
 }
 
-fn gen_proof<
+pub fn gen_proof<
     C: Circuit<Fr>,
     E: EncodedChallenge<G1Affine>,
     TR: TranscriptReadBuffer<Cursor<Vec<u8>>, G1Affine, E>,
@@ -309,7 +309,7 @@ fn gen_proof<
     proof
 }
 
-fn gen_aggregation_evm_verifier(
+pub fn gen_aggregation_evm_verifier(
     params: &ParamsKZG<Bn256>,
     vk: &VerifyingKey<G1Affine>,
     num_instance: Vec<usize>,
