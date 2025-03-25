@@ -86,8 +86,11 @@ impl<F: Field> Circuit<F> for MulChip<F> {
         let result = layouter.assign_region(
             || "Mul",
             |mut region: Region<'_, F>| {
-                config.selector.enable(&mut region, 1)?;
-                let val = self.a * self.b;
+                config.selector.enable(&mut region, 0)?;
+                let a = region.assign_advice(config.a, 0, self.a);
+                let b = region.assign_advice(config.b, 0, self.b);
+
+                let val = a.value().cloned().cloned() * b.value().cloned().cloned();
                 let mul = region.assign_advice(config.a, 1, val);
 
                 Ok(mul)
